@@ -1,0 +1,194 @@
+name: Build Zephyr Examples
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - 'examples/**'
+      - '.github/workflows/build-examples.yml'
+  pull_request:
+    branches: ["main", "master"]
+    paths:
+      - 'examples/**'
+      - '.github/workflows/build-examples.yml'
+  workflow_dispatch:
+
+env:
+  ZEPHYR_SDK_VERSION: 0.16.5
+  ZEPHYR_VERSION: v3.6.0
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Part 1 - Getting Started
+          - example: part1/hello-world
+            board: stm32f769i_disco
+            artifact: part1-hello-world
+          - example: part1/blinky
+            board: stm32f769i_disco
+            artifact: part1-blinky
+
+          # Part 3 - Threading
+          - example: part3/threads
+            board: stm32f769i_disco
+            artifact: part3-threads
+          - example: part3/timers
+            board: stm32f769i_disco
+            artifact: part3-timers
+          - example: part3/workqueue
+            board: stm32f769i_disco
+            artifact: part3-workqueue
+
+          # Part 4 - Synchronization
+          - example: part4/mutex
+            board: stm32f769i_disco
+            artifact: part4-mutex
+          - example: part4/semaphore
+            board: stm32f769i_disco
+            artifact: part4-semaphore
+          - example: part4/msgq
+            board: stm32f769i_disco
+            artifact: part4-msgq
+          - example: part4/zbus
+            board: stm32f769i_disco
+            artifact: part4-zbus
+
+          # Part 5 - Hardware (STM32F769I-DISCO has LED, buttons, I2C, UART)
+          - example: part5/gpio
+            board: stm32f769i_disco
+            artifact: part5-gpio
+          - example: part5/i2c-sensor
+            board: stm32f769i_disco
+            artifact: part5-i2c-sensor
+          - example: part5/uart
+            board: stm32f769i_disco
+            artifact: part5-uart
+
+          # Part 6 - Connectivity (STM32F769I-DISCO has Ethernet)
+          - example: part6/tcp-client
+            board: stm32f769i_disco
+            artifact: part6-tcp-client
+          - example: part6/mqtt
+            board: stm32f769i_disco
+            artifact: part6-mqtt
+          # BLE requires Nordic board
+          - example: part6/ble-peripheral
+            board: nrf52840dk_nrf52840
+            artifact: part6-ble-peripheral
+
+    name: Build ${{ matrix.example }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Zephyr SDK
+        uses: actions/cache@v4
+        id: cache-sdk
+        with:
+          path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-minimal
+
+      - name: Cache West modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/zephyrproject
+            ~/.cache/pip
+          key: west-modules-${{ env.ZEPHYR_VERSION }}-${{ hashFiles('examples/west.yml') }}
+          restore-keys: |
+            west-modules-${{ env.ZEPHYR_VERSION }}-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git cmake ninja-build gperf ccache dfu-util \
+            device-tree-compiler wget python3-dev python3-pip \
+            python3-setuptools python3-tk python3-wheel \
+            xz-utils file make gcc gcc-multilib g++-multilib \
+            libsdl2-dev libmagic1
+
+      - name: Install West
+        run: pip3 install west
+
+      - name: Download Zephyr SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          cd ~
+          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz
+          rm zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz
+
+      - name: Install Zephyr SDK toolchains
+        run: |
+          cd ~/zephyr-sdk-${ZEPHYR_SDK_VERSION}
+          # Install ARM toolchain (for STM32, nRF boards)
+          ./setup.sh -t arm-zephyr-eabi -h -c || true
+
+      - name: Initialize West workspace
+        run: |
+          if [ ! -d ~/zephyrproject/.west ]; then
+            cd ~
+            west init zephyrproject -m https://github.com/zephyrproject-rtos/zephyr --mr ${ZEPHYR_VERSION}
+            cd zephyrproject
+            west update --narrow -o=--depth=1
+          fi
+
+      - name: Install Python requirements
+        run: pip3 install -r ~/zephyrproject/zephyr/scripts/requirements.txt
+
+      - name: Build example
+        run: |
+          export ZEPHYR_BASE=~/zephyrproject/zephyr
+          export ZEPHYR_SDK_INSTALL_DIR=~/zephyr-sdk-${ZEPHYR_SDK_VERSION}
+          cd ~/zephyrproject
+          west build -b ${{ matrix.board }} $GITHUB_WORKSPACE/examples/${{ matrix.example }} \
+            --build-dir $GITHUB_WORKSPACE/examples/build/${{ matrix.example }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-${{ matrix.artifact }}
+          path: examples/build/${{ matrix.example }}/zephyr/zephyr.*
+          retention-days: 7
+          if-no-files-found: ignore
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All Zephyr examples have been built." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Example | Board |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| part1/hello-world | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part1/blinky | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part3/threads | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part3/timers | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part3/workqueue | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part4/mutex | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part4/semaphore | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part4/msgq | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part4/zbus | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part5/gpio | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part5/i2c-sensor | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part5/uart | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part6/tcp-client | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part6/mqtt | stm32f769i_disco |" >> $GITHUB_STEP_SUMMARY
+          echo "| part6/ble-peripheral | nrf52840dk_nrf52840 |" >> $GITHUB_STEP_SUMMARY
